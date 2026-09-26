@@ -1,5 +1,5 @@
 import { writable, get } from 'svelte/store'
-import type { Announcement, Cue, CueStatus, DeskState, Reminder, Session, Speaker, Term } from './types'
+import type { Announcement, Cue, CueStatus, DeskState, QaSession, Reminder, Session, Speaker, Term } from './types'
 
 const STORAGE_KEY = 'conference-cue-desk-v1'
 const speakers: Speaker[] = [
@@ -24,10 +24,10 @@ const terms: Term[] = [
 function initialCues(): Cue[] {
   const now = Date.now()
   return [
-    { id: 'cue-101', speakerId: 'sp-1', text: 'The urban heat island effect is not evenly distributed across a city.', receivedAt: now - 36000, status: 'confirmed', manual: false, offline: false, delaySeconds: 4, duplicateOf: null, followupText: '', tags: ['城市热岛'] },
-    { id: 'cue-102', speakerId: 'sp-1', text: 'Neighborhoods with less tree canopy can be several degrees warmer at night.', receivedAt: now - 19000, status: 'confirmed', manual: false, offline: false, delaySeconds: 6, duplicateOf: null, followupText: '补译：“夜间温差可达数摄氏度。”', tags: ['树冠覆盖率'] },
-    { id: 'cue-103', speakerId: 'sp-1', text: 'Our resilience strategy links cooling corridors with public health investments.', receivedAt: now - 9000, status: 'pending', manual: false, offline: false, delaySeconds: 11, duplicateOf: null, followupText: '', tags: ['韧性', '协同效益'] },
-    { id: 'cue-104', speakerId: 'sp-1', text: 'That data also reveals health equity gaps between districts.', receivedAt: now - 2500, status: 'pending', manual: false, offline: false, delaySeconds: 4, duplicateOf: null, followupText: '', tags: ['健康公平'] }
+    { id: 'cue-101', speakerId: 'sp-1', text: 'The urban heat island effect is not evenly distributed across a city.', receivedAt: now - 36000, status: 'confirmed', manual: false, offline: false, delaySeconds: 4, duplicateOf: null, followupText: '', tags: ['城市热岛'], kind: 'speech', asker: '', qaQueued: false, qaNotes: [] },
+    { id: 'cue-102', speakerId: 'sp-1', text: 'Neighborhoods with less tree canopy can be several degrees warmer at night.', receivedAt: now - 19000, status: 'confirmed', manual: false, offline: false, delaySeconds: 6, duplicateOf: null, followupText: '补译：“夜间温差可达数摄氏度。”', tags: ['树冠覆盖率'], kind: 'speech', asker: '', qaQueued: false, qaNotes: [] },
+    { id: 'cue-103', speakerId: 'sp-1', text: 'Our resilience strategy links cooling corridors with public health investments.', receivedAt: now - 9000, status: 'pending', manual: false, offline: false, delaySeconds: 11, duplicateOf: null, followupText: '', tags: ['韧性', '协同效益'], kind: 'speech', asker: '', qaQueued: false, qaNotes: [] },
+    { id: 'cue-104', speakerId: 'sp-1', text: 'That data also reveals health equity gaps between districts.', receivedAt: now - 2500, status: 'pending', manual: false, offline: false, delaySeconds: 4, duplicateOf: null, followupText: '', tags: ['健康公平'], kind: 'speech', asker: '', qaQueued: false, qaNotes: [] }
   ]
 }
 function demoState(): DeskState {
@@ -37,15 +37,29 @@ function demoState(): DeskState {
       { id: 'ann-1', level: 'info', text: '十点整有消防联动测试，请提醒会场人员保持镇定。', visibleOnStage: false, createdAt: new Date().toISOString() },
       { id: 'ann-2', level: 'urgent', text: '请下一位发言人提前到侧台候场。', visibleOnStage: false, createdAt: new Date().toISOString() }
     ],
-    online: true, liveSimulation: true, updatedAt: new Date().toISOString()
+    online: true, liveSimulation: true, qa: null, updatedAt: new Date().toISOString()
   }
 }
 function clone<T>(value: T): T { return structuredClone(value) }
+function normalize(raw: DeskState): DeskState {
+  const state = raw as DeskState & { qa?: QaSession | null }
+  if (state.qa === undefined) state.qa = null
+  state.cues.forEach(cue => {
+    if (cue.kind !== 'question') cue.kind = 'speech'
+    if (typeof cue.asker !== 'string') cue.asker = ''
+    if (!Array.isArray(cue.qaNotes)) cue.qaNotes = []
+    if (typeof cue.qaQueued !== 'boolean') cue.qaQueued = false
+  })
+  // 问答进行中刷新页面：沿用上次待译位置继续，会话状态保持
+  if (state.qa && !state.cues.some(cue => cue.id === state.activeCueId)) state.activeCueId = state.qa.questionCueIds.at(-1) || state.qa.anchorCueId
+  return state
+}
 function loadState(): DeskState {
   if (typeof localStorage === 'undefined') return demoState()
   try {
     const saved = localStorage.getItem(STORAGE_KEY)
-    return saved ? { ...demoState(), ...JSON.parse(saved), online: navigator.onLine } : demoState()
+    if (!saved) return demoState()
+    return normalize({ ...demoState(), ...JSON.parse(saved), online: navigator.onLine })
   } catch { return demoState() }
 }
 const history: DeskState[] = []
@@ -132,9 +146,100 @@ export function ingestCue(text: string, options: { manual?: boolean; speakerId?:
     const cue: Cue = {
       id: `cue-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, speakerId, text: trimmed, receivedAt,
       status: 'pending', manual: Boolean(options.manual), offline: !state.online, delaySeconds: Math.max(0, Math.round((Date.now() - receivedAt) / 1000)),
-      duplicateOf: duplicate?.id || null, followupText: '', tags: detectTerms(trimmed, state.terms)
+      duplicateOf: duplicate?.id || null, followupText: '', tags: detectTerms(trimmed, state.terms),
+      kind: 'speech', asker: '', qaQueued: Boolean(state.qa), qaNotes: []
     }
-    state.cues.push(cue); state.activeCueId = cue.id
+    state.cues.push(cue)
+    // 问答接力中：问题占住当前待译位置，新演讲内容只排队，不抢焦点
+    if (!state.qa) state.activeCueId = cue.id
+  })
+}
+
+/** 管理员从当前段落切入问答：记下切入位置，问题随后占当前待译位 */
+export function enterQa() {
+  const state = get(desk)
+  if (state.qa) return
+  const active = state.cues.find(item => item.id === state.activeCueId) || state.cues.at(-1)
+  if (!active) return
+  const startedAt = Date.now()
+  commit(next => {
+    next.qa = { anchorCueId: active.id, resumedCueId: active.id, startedAt, questionCueIds: [] }
+    next.cues.forEach(cue => { cue.qaQueued = false })
+  })
+}
+
+/** 录入问题（或主持人追问）：插入并占住当前待译位置 */
+export function submitQuestion(text: string, asker: string, options: { speakerId?: string } = {}) {
+  const trimmed = text.trim()
+  if (!trimmed) return
+  const state = get(desk)
+  if (!state.qa) return
+  // 同一轮问答里提交新问题：上一个问题视为已传
+  const previousId = state.qa.questionCueIds.at(-1)
+  commit(next => {
+    if (!next.qa) return
+    if (previousId) {
+      const previous = next.cues.find(cue => cue.id === previousId)
+      if (previous && previous.status === 'pending') previous.status = 'confirmed'
+    }
+    const speakerId = options.speakerId || next.sessions.find(item => item.status === 'live')?.speakerId || next.speakers[0]?.id || ''
+    const cue: Cue = {
+      id: `cue-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, speakerId, text: trimmed, receivedAt: Date.now(),
+      status: 'pending', manual: true, offline: !next.online, delaySeconds: 0,
+      duplicateOf: null, followupText: '', tags: detectTerms(trimmed, next.terms),
+      kind: 'question', asker: asker.trim() || '现场提问', qaQueued: false, qaNotes: []
+    }
+    next.cues.push(cue)
+    next.activeCueId = cue.id
+    next.qa.questionCueIds.push(cue.id)
+  })
+}
+
+/** 回答完成：把问题、提问人和处理时间留在切入段落旁，回到切入前那段 */
+export function finishQa(answer = '') {
+  const state = get(desk)
+  const qa = state.qa
+  if (!qa) return
+  const endedAt = Date.now()
+  const trimmedAnswer = answer.trim()
+  commit(next => {
+    if (!next.qa) return
+    const anchor = next.cues.find(cue => cue.id === qa.anchorCueId)
+    qa.questionCueIds.forEach((id, index) => {
+      const cue = next.cues.find(item => item.id === id)
+      if (!cue) return
+      cue.status = 'confirmed'
+      if (anchor) {
+        anchor.qaNotes.push({
+          id: `qa-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 6)}`,
+          asker: cue.asker,
+          question: cue.text,
+          // 回答摘要只随最后一条问题保存
+          answer: index === qa.questionCueIds.length - 1 ? trimmedAnswer : '',
+          startedAt: index === 0 ? qa.startedAt : cue.receivedAt,
+          endedAt: index === qa.questionCueIds.length - 1 ? endedAt : cue.receivedAt
+        })
+      }
+    })
+    next.cues.forEach(cue => { cue.qaQueued = false })
+    const resumeExists = next.cues.some(cue => cue.id === qa.resumedCueId)
+    next.activeCueId = resumeExists ? qa.resumedCueId : next.cues.at(-1)?.id || ''
+    next.qa = null
+  })
+}
+
+/** 放弃本次问答接力：移除录入的问题（均为手工录入），演讲排队内容保留 */
+export function cancelQa() {
+  const state = get(desk)
+  const qa = state.qa
+  if (!qa) return
+  commit(next => {
+    if (!next.qa) return
+    next.cues = next.cues.filter(cue => !qa.questionCueIds.includes(cue.id))
+    next.cues.forEach(cue => { cue.qaQueued = false })
+    const resumeExists = next.cues.some(cue => cue.id === qa.resumedCueId)
+    next.activeCueId = resumeExists ? qa.resumedCueId : next.cues.at(-1)?.id || ''
+    next.qa = null
   })
 }
 export function updateCue(id: string, patch: Partial<Cue>) { commit(state => { const cue = state.cues.find(item => item.id === id); if (cue) Object.assign(cue, patch) }) }

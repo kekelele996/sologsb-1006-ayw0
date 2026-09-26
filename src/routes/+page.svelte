@@ -2,10 +2,10 @@
   import { onMount } from 'svelte'
   import Button from 'flowbite-svelte/Button.svelte'
   import {
-    acknowledgeReminder, addAnnouncement, addSession, addSpeaker, addTerm, canRedo, canUndo, clearDuplicate,
-    deleteCue, desk, getDelay, ingestCue, moveCue, publishAnnouncement, redoDesk, sendReminder, setActiveCue,
-    setCueStatus, setFontScale, setLiveSimulation, setOnline, speakerName, termTarget, undoDesk, updateCue,
-    updateSession, updateSpeaker, updateTerm
+    acknowledgeReminder, addAnnouncement, addSession, addSpeaker, addTerm, canRedo, canUndo, cancelQa, clearDuplicate,
+    deleteCue, desk, enterQa, finishQa, getDelay, ingestCue, moveCue, publishAnnouncement, redoDesk, sendReminder,
+    setActiveCue, setCueStatus, setFontScale, setLiveSimulation, setOnline, speakerName, submitQuestion, termTarget,
+    undoDesk, updateCue, updateSession, updateSpeaker, updateTerm
   } from '$lib/store'
   import type { Announcement, Cue, Session, TabId, Term } from '$lib/types'
 
@@ -22,6 +22,10 @@
   let manualSpeakerId = ''
   let cueNote = ''
   let followup = ''
+  let questionText = ''
+  let questionAsker = ''
+  let answerText = ''
+  let questionInput: HTMLTextAreaElement
   let reminderTermId = ''
   let notice = ''
   let announcementText = ''
@@ -32,9 +36,15 @@
 
   $: currentSession = $desk.sessions.find(item => item.status === 'live') || $desk.sessions[0]
   $: activeCue = $desk.cues.find(item => item.id === $desk.activeCueId) || $desk.cues.at(-1)
+  $: qaActive = $desk.qa !== null
+  $: qaAnchor = $desk.qa ? $desk.cues.find(item => item.id === $desk.qa!.anchorCueId) : undefined
+  $: currentQuestion = $desk.qa
+    ? $desk.cues.find(item => item.id === $desk.qa!.questionCueIds.at(-1))
+    : undefined
+  $: qaQueueCount = $desk.cues.filter(item => item.qaQueued).length
   $: pendingCount = $desk.cues.filter(item => item.status === 'pending').length
   $: offlineCount = $desk.cues.filter(item => item.offline).length
-  $: lateCount = $desk.cues.filter(item => getDelay(item, now) > 8 && item.status !== 'confirmed').length
+  $: lateCount = $desk.cues.filter(item => getDelay(item, now) > 8 && item.status !== 'confirmed' && !item.qaQueued).length
   $: duplicateCount = $desk.cues.filter(item => item.duplicateOf).length
   $: activeSpeaker = $desk.speakers.find(item => item.id === activeCue?.speakerId)
   $: activeTerms = $desk.terms.filter(item => item.speakerId === activeCue?.speakerId || activeCue?.tags.includes(item.target))
@@ -74,9 +84,40 @@
   }
   function confirmActive() {
     if (!activeCue) return
+    if (qaActive && activeCue.kind === 'question') { flash('问答问题请在问答面板完成或追问，C 不确认问题。'); return }
     setCueStatus(activeCue.id, 'confirmed')
     flash('已确认传译，队列自动前进。')
     moveCue(1)
+  }
+  function startQa() {
+    if (qaActive || !activeCue) return
+    enterQa()
+    flash('已切入问答：问题将占当前待译位，后续演讲内容自动排队。')
+    setTimeout(() => questionInput?.focus(), 0)
+  }
+  function sendQuestion() {
+    if (!questionText.trim() || !$desk.qa) return
+    const isFollowup = $desk.qa.questionCueIds.length > 0
+    submitQuestion(questionText, questionAsker)
+    questionText = ''
+    questionInput?.focus()
+    flash(isFollowup ? '追问已占当前待译位。' : '问题已占当前待译位。')
+  }
+  function completeQa() {
+    if (!$desk.qa) return
+    finishQa(answerText)
+    questionText = ''
+    questionAsker = ''
+    answerText = ''
+    flash('问答完成，已回到切入前段落并附上问题记录。')
+  }
+  function abortQa() {
+    if (!$desk.qa) return
+    cancelQa()
+    questionText = ''
+    questionAsker = ''
+    answerText = ''
+    flash('已结束问答接力并回到切入前段落，录入的问题已移除。')
   }
   function saveFollowup() {
     if (!activeCue || !followup.trim()) return
@@ -108,6 +149,12 @@
   function formatTime(timestamp: number) {
     return new Date(timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
   }
+  function formatDuration(ms: number) {
+    const seconds = Math.max(0, Math.round(ms / 1000))
+    const m = Math.floor(seconds / 60)
+    const s = seconds % 60
+    return m > 0 ? `${m} 分 ${s} 秒` : `${s} 秒`
+  }
   function delayClass(seconds: number) {
     if (seconds > 12) return 'bg-red-100 text-red-800 border-red-200'
     if (seconds > 8) return 'bg-amber-100 text-amber-900 border-amber-200'
@@ -126,6 +173,7 @@
     if (event.key === 'j' || event.key === 'ArrowDown') { event.preventDefault(); moveCue(1) }
     if (event.key === 'k' || event.key === 'ArrowUp') { event.preventDefault(); moveCue(-1) }
     if (event.key.toLowerCase() === 'c') { event.preventDefault(); confirmActive() }
+    if (event.key.toLowerCase() === 'q' && tab === 'live' && !qaActive) { event.preventDefault(); startQa() }
     if (event.key.toLowerCase() === 'n') { event.preventDefault(); manualInput?.focus(); flash('手工录入已获焦，输入后按 Ctrl + Enter 提交。') }
     if (event.key.toLowerCase() === 't' && activeTerms[0]) { event.preventDefault(); sendTermReminder(activeTerms[0].id) }
     if (event.key === '?') { event.preventDefault(); showHelp = true }
@@ -185,6 +233,16 @@
         </div>
       </div>
 
+      {#if qaActive}
+        <div role="status" class="mb-4 flex flex-wrap items-center gap-3 rounded-2xl border border-indigo-300 bg-indigo-50 px-4 py-3 text-sm text-indigo-900 shadow-sm">
+          <span class="rounded-full bg-indigo-600 px-2.5 py-1 text-[10px] font-black text-white">问答接力</span>
+          <span class="font-bold">问题占住当前待译位，主持人追问不会混入普通段落。</span>
+          <span class="text-xs text-indigo-700">切入段落：第 {$desk.cues.findIndex(item => item.id === $desk.qa!.anchorCueId) + 1} 条 · 已处理 {formatDuration(now - $desk.qa!.startedAt)}</span>
+          <span class="rounded-full bg-white px-2.5 py-1 text-[11px] font-bold text-indigo-700">后续演讲排队 {qaQueueCount} 条</span>
+          <span class="ml-auto text-xs text-indigo-700">完成后自动回到切入前那段并留下问答记录</span>
+        </div>
+      {/if}
+
       <div class="grid gap-4 xl:grid-cols-[minmax(0,1.65fr)_minmax(300px,.75fr)]">
         <div class="space-y-4">
           <section class="overflow-hidden rounded-2xl border border-teal-800 bg-[#0d3b36] text-white shadow-lg">
@@ -198,7 +256,13 @@
               {/each}
               {#each $desk.cues.filter(item => item.status === 'confirmed').slice(-2) as cue}
                 <div class="rounded-xl bg-white/10 p-3">
-                  <div class="mb-1 flex justify-between text-[10px] text-teal-200"><span>{speakerName($desk, cue.speakerId)}</span><span>{formatTime(cue.receivedAt)}</span></div>
+                  <div class="mb-1 flex justify-between text-[10px] text-teal-200">
+                    <span class="flex items-center gap-1.5">
+                      {#if cue.kind === 'question'}<span class="rounded bg-orange-500 px-1.5 py-0.5 font-black text-white">问</span>{/if}
+                      {cue.kind === 'question' && cue.asker ? cue.asker : speakerName($desk, cue.speakerId)}
+                    </span>
+                    <span>{formatTime(cue.receivedAt)}</span>
+                  </div>
                   <p class="text-base leading-relaxed lg:text-lg">{cue.text}</p>
                 </div>
               {/each}
@@ -216,16 +280,19 @@
             <div class="max-h-[600px] space-y-2 overflow-y-auto p-3 scrollbar-thin">
               {#each $desk.cues as cue, index}
                 <!-- svelte-ignore a11y_no_noninteractive_element_to_interactive_role -->
-                <article role="button" tabindex="0" class="cue-enter cursor-pointer rounded-xl border p-3 transition {cue.id === $desk.activeCueId ? 'border-teal-600 bg-teal-50 shadow-md' : 'border-slate-200 bg-white hover:border-slate-300'}" on:click={() => selectCue(cue)} on:keydown={event => (event.key === 'Enter' || event.key === ' ') && selectCue(cue)}>
+                <article role="button" tabindex="0" class="cue-enter cursor-pointer rounded-xl border p-3 transition {cue.id === $desk.activeCueId ? (cue.kind === 'question' ? 'border-orange-500 bg-orange-50 shadow-md' : 'border-teal-600 bg-teal-50 shadow-md') : cue.kind === 'question' ? 'border-orange-200 bg-orange-50/60' : 'border-slate-200 bg-white hover:border-slate-300'}" on:click={() => selectCue(cue)} on:keydown={event => (event.key === 'Enter' || event.key === ' ') && selectCue(cue)}>
                   <div class="flex flex-wrap items-start gap-3">
-                    <span class="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-slate-900 text-xs font-black text-white">{index + 1}</span>
+                    <span class="grid h-8 w-8 shrink-0 place-items-center rounded-lg {cue.kind === 'question' ? 'bg-orange-500' : 'bg-slate-900'} text-xs font-black text-white">{cue.kind === 'question' ? '问' : index + 1}</span>
                     <div class="min-w-0 flex-1">
                       <div class="mb-2 flex flex-wrap items-center gap-2 text-[10px] font-bold">
-                        <span class="rounded-md bg-slate-100 px-2 py-1 text-slate-600">{speakerName($desk, cue.speakerId)}</span>
+                        <span class="rounded-md bg-slate-100 px-2 py-1 text-slate-600">{cue.kind === 'question' && cue.asker ? cue.asker : speakerName($desk, cue.speakerId)}</span>
+                        {#if cue.kind === 'question'}<span class="rounded-md bg-orange-100 px-2 py-1 text-orange-800">现场问答</span>{/if}
+                        {#if cue.qaQueued}<span class="rounded-md bg-indigo-100 px-2 py-1 text-indigo-800">问答期间到达 · 排队</span>{/if}
                         <span class="rounded-md border px-2 py-1 {delayClass(getDelay(cue, now))}">{formatTime(cue.receivedAt)} · 延迟 {getDelay(cue, now)}s</span>
                         <span class="rounded-md px-2 py-1 {cue.status === 'confirmed' ? 'bg-emerald-100 text-emerald-800' : cue.status === 'followup' ? 'bg-amber-100 text-amber-900' : 'bg-blue-100 text-blue-800'}">{statusLabel(cue.status)}</span>
                         {#if cue.offline}<span class="rounded-md bg-amber-100 px-2 py-1 text-amber-900">离线暂存</span>{/if}
                         {#if cue.manual}<span class="rounded-md bg-slate-100 px-2 py-1 text-slate-600">手工</span>{/if}
+                        {#if $desk.qa?.anchorCueId === cue.id}<span class="rounded-md bg-indigo-600 px-2 py-1 text-white">问答切入段落</span>{/if}
                       </div>
                       <p class="text-sm leading-6 lg:text-base">{cue.text}</p>
                       {#if cue.duplicateOf}
@@ -235,6 +302,22 @@
                         </div>
                       {/if}
                       {#if cue.followupText}<p class="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-900"><strong>补译：</strong>{cue.followupText}</p>{/if}
+                      {#if cue.qaNotes.length}
+                        <div class="mt-2 space-y-2 rounded-lg border border-indigo-200 bg-indigo-50/70 p-3">
+                          <strong class="block text-[10px] font-black uppercase tracking-wider text-indigo-700">问答接力记录 · {cue.qaNotes.length} 个问题</strong>
+                          {#each cue.qaNotes as note, noteIndex}
+                            <div class="rounded-lg bg-white/80 px-3 py-2 text-xs text-slate-700">
+                              <div class="flex flex-wrap items-center gap-2 font-bold text-indigo-900">
+                                <span class="rounded bg-indigo-600 px-1.5 py-0.5 text-[10px] text-white">问 {noteIndex + 1}</span>
+                                <span>{note.asker}</span>
+                                <span class="ml-auto font-normal text-slate-500">{formatTime(note.startedAt)} – {formatTime(note.endedAt)} · 用时 {formatDuration(note.endedAt - note.startedAt)}</span>
+                              </div>
+                              <p class="mt-1 leading-5">{note.question}</p>
+                              {#if note.answer}<p class="mt-1 rounded bg-emerald-50 px-2 py-1 text-emerald-900"><strong>回答摘要：</strong>{note.answer}</p>{/if}
+                            </div>
+                          {/each}
+                        </div>
+                      {/if}
                       <div class="mt-2 flex flex-wrap gap-1">{#each cue.tags as tag}<span class="rounded-full bg-teal-100 px-2 py-1 text-[10px] font-bold text-teal-800">{tag}</span>{/each}</div>
                     </div>
                   </div>
@@ -245,17 +328,62 @@
         </div>
 
         <div class="space-y-4">
-          <section class="rounded-2xl border bg-white p-4 shadow-sm">
+          <section class="rounded-2xl border p-4 shadow-sm {qaActive ? 'border-orange-300 bg-orange-50/40' : 'bg-white'}">
             <div class="mb-3 flex items-start justify-between gap-3">
-              <div><span class="text-[10px] font-black uppercase tracking-[.16em] text-teal-700">当前口译位</span><h2 class="mt-1 font-bold">{activeSpeaker?.name || '等待队列'}</h2><p class="text-xs text-slate-500">{activeSpeaker?.language}</p></div>
+              <div>
+                <span class="text-[10px] font-black uppercase tracking-[.16em] {qaActive ? 'text-orange-700' : 'text-teal-700'}">{qaActive ? '问答接力中' : '当前口译位'}</span>
+                <h2 class="mt-1 font-bold">{qaActive ? (currentQuestion ? `提问：${currentQuestion.asker}` : '等待录入问题') : (activeSpeaker?.name || '等待队列')}</h2>
+                <p class="text-xs text-slate-500">{qaActive ? '问题占当前待译位 · 后续演讲先排队' : activeSpeaker?.language}</p>
+              </div>
               <div class="flex gap-1"><button class="focus-ring rounded-lg border px-2 py-1 text-xs" aria-label="上一条" on:click={() => moveCue(-1)}>↑</button><button class="focus-ring rounded-lg border px-2 py-1 text-xs" aria-label="下一条" on:click={() => moveCue(1)}>↓</button></div>
             </div>
-            {#if activeCue}
-              <div class="rounded-xl bg-slate-50 p-3"><p class="text-sm leading-6">{activeCue.text}</p><p class="mt-2 text-[10px] text-slate-500">快捷键：J / K 移动，C 确认，T 发送首条高优先术语提醒</p></div>
-              <div class="mt-3 grid grid-cols-2 gap-2"><Button color="green" on:click={confirmActive}>确认已传 <kbd class="ml-1 text-[10px]">C</kbd></Button><Button color="yellow" on:click={() => tab = 'offline'}>手工补充</Button></div>
-              <label for="followup-input" class="mt-4 block text-[10px] font-black uppercase tracking-wider text-slate-500">遗漏补译</label>
-              <textarea id="followup-input" class="focus-ring mt-2 w-full rounded-xl border p-3 text-sm" rows="3" bind:value={followup} placeholder="输入遗漏内容或修正术语…"></textarea>
-              <Button class="mt-2 w-full" color="light" disabled={!followup.trim()} on:click={saveFollowup}>标记补充完成</Button>
+
+            {#if !qaActive}
+              {#if activeCue}
+                <div class="rounded-xl bg-slate-50 p-3"><p class="text-sm leading-6">{activeCue.text}</p><p class="mt-2 text-[10px] text-slate-500">快捷键：J / K 移动，C 确认，Q 切入问答，T 发送首条高优先术语提醒</p></div>
+                <div class="mt-3 grid grid-cols-2 gap-2"><Button color="green" on:click={confirmActive}>确认已传 <kbd class="ml-1 text-[10px]">C</kbd></Button><Button color="yellow" on:click={() => tab = 'offline'}>手工补充</Button></div>
+                <Button class="mt-2 w-full" color="red" on:click={startQa}>切入问答接力 <kbd class="ml-1 text-[10px]">Q</kbd></Button>
+                <label for="followup-input" class="mt-4 block text-[10px] font-black uppercase tracking-wider text-slate-500">遗漏补译</label>
+                <textarea id="followup-input" class="focus-ring mt-2 w-full rounded-xl border p-3 text-sm" rows="3" bind:value={followup} placeholder="输入遗漏内容或修正术语…"></textarea>
+                <Button class="mt-2 w-full" color="light" disabled={!followup.trim()} on:click={saveFollowup}>标记补充完成</Button>
+              {/if}
+            {:else}
+              {#if qaAnchor}
+                <div class="rounded-xl border border-indigo-200 bg-indigo-50 p-3 text-xs text-indigo-900">
+                  <strong class="block text-[10px] font-black uppercase tracking-wider text-indigo-700">切入前段落 · 完成后回到这里</strong>
+                  <p class="mt-1 line-clamp-2 leading-5">{qaAnchor.text}</p>
+                </div>
+              {/if}
+              <div class="mt-3 grid grid-cols-2 gap-2 text-center">
+                <div class="rounded-xl border bg-white px-2 py-2"><strong class="block text-lg text-orange-700">{$desk.qa!.questionCueIds.length}</strong><span class="text-[10px] text-slate-500">已录问题</span></div>
+                <div class="rounded-xl border bg-white px-2 py-2"><strong class="block text-lg text-indigo-700">{qaQueueCount}</strong><span class="text-[10px] text-slate-500">演讲排队</span></div>
+              </div>
+              <p class="mt-2 text-center text-[11px] font-bold text-orange-800">本轮已处理 {formatDuration(now - $desk.qa!.startedAt)}</p>
+
+              {#if currentQuestion}
+                <div class="mt-3 rounded-xl border border-orange-300 bg-white p-3">
+                  <div class="flex items-center justify-between gap-2 text-[10px] font-bold text-orange-800"><span class="rounded bg-orange-100 px-2 py-1">{currentQuestion.asker}</span><span>{formatTime(currentQuestion.receivedAt)}</span></div>
+                  <p class="mt-2 text-sm font-bold leading-6">{currentQuestion.text}</p>
+                </div>
+              {/if}
+
+              <label for="question-asker" class="mt-3 block text-[10px] font-black uppercase tracking-wider text-slate-500">{currentQuestion ? '追问人（可选）' : '提问人（可选）'}</label>
+              <input id="question-asker" class="focus-ring mt-1 w-full rounded-xl border p-2.5 text-sm" list="asker-list" bind:value={questionAsker} placeholder="如：中央电视台记者 / 第三排代表" />
+              <datalist id="asker-list">
+                <option value="主持人"></option>
+                <option value="现场记者"></option>
+                <option value="观众代表"></option>
+              </datalist>
+              <label for="question-input" class="mt-3 block text-[10px] font-black uppercase tracking-wider text-slate-500">{currentQuestion ? '主持人追问 / 新问题' : '现场问题内容'}</label>
+              <textarea id="question-input" bind:this={questionInput} class="focus-ring mt-1 w-full rounded-xl border p-3 text-sm" rows="3" bind:value={questionText} placeholder="问题将插入当前待译位置，演讲内容自动排队…" on:keydown={event => { if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') sendQuestion() }}></textarea>
+              <Button class="mt-2 w-full" color="yellow" disabled={!questionText.trim()} on:click={sendQuestion}>{currentQuestion ? '录入追问并占待译位' : '录入问题并占待译位'}</Button>
+
+              <label for="answer-input" class="mt-4 block text-[10px] font-black uppercase tracking-wider text-slate-500">回答摘要（可选，随记录留存）</label>
+              <textarea id="answer-input" class="focus-ring mt-1 w-full rounded-xl border p-3 text-sm" rows="2" bind:value={answerText} placeholder="概括发言人回答要点…"></textarea>
+              <div class="mt-2 grid grid-cols-2 gap-2">
+                <Button color="green" on:click={completeQa}>回答完成 · 回切入段</Button>
+                <Button color="light" on:click={abortQa}>放弃接力</Button>
+              </div>
             {/if}
           </section>
 
@@ -383,7 +511,7 @@
     <div class="w-full max-w-xl rounded-2xl bg-white p-5 shadow-2xl" role="dialog" tabindex="-1" aria-modal="true" aria-labelledby="shortcut-title" on:click|stopPropagation on:keydown|stopPropagation>
       <div class="flex items-start justify-between"><div><span class="text-[10px] font-black uppercase tracking-[.16em] text-teal-700">Keyboard First</span><h2 id="shortcut-title" class="mt-1 text-xl font-black">键盘操作</h2></div><button class="rounded-lg px-2 py-1 text-xl" aria-label="关闭" on:click={() => showHelp = false}>×</button></div>
       <div class="mt-4 grid gap-2 sm:grid-cols-2">
-        {#each [['J / ↓','下一条队列'],['K / ↑','上一条队列'],['C','确认已传并前进'],['N','聚焦手工录入'],['T','发送当前高优先术语'],['+ / −','调整界面字号'],['Ctrl + Z','撤销'],['Ctrl + Shift + Z','重做']] as shortcut}
+        {#each [['J / ↓','下一条队列'],['K / ↑','上一条队列'],['C','确认已传并前进'],['Q','从当前段切入问答接力'],['N','聚焦手工录入'],['T','发送当前高优先术语'],['+ / −','调整界面字号'],['Ctrl + Z','撤销'],['Ctrl + Shift + Z','重做']] as shortcut}
           <div class="flex items-center justify-between rounded-xl bg-slate-50 px-3 py-2"><kbd class="rounded-md border bg-white px-2 py-1 text-xs font-black">{shortcut[0]}</kbd><span class="text-xs text-slate-600">{shortcut[1]}</span></div>
         {/each}
       </div>
