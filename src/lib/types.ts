@@ -1,4 +1,5 @@
 export type CueStatus = 'pending' | 'confirmed' | 'followup'
+export type CueKind = 'speech' | 'question'
 export type TabId = 'live' | 'backstage' | 'terms' | 'offline'
 
 export interface Speaker {
@@ -42,12 +43,32 @@ export interface Cue {
   text: string
   receivedAt: number
   status: CueStatus
+  kind: CueKind
+  asker: string
   manual: boolean
   offline: boolean
   delaySeconds: number
   duplicateOf: string | null
   followupText: string
   tags: string[]
+  qaLogs: QaLog[]
+}
+
+export interface QaLog {
+  id: string
+  questionId: string
+  question: string
+  asker: string
+  startedAt: number
+  endedAt: number
+  durationSeconds: number
+}
+
+export interface QaRelay {
+  id: string
+  anchorCueId: string
+  startedAt: number
+  questionIds: string[]
 }
 
 export interface Reminder {
@@ -66,6 +87,7 @@ export interface DeskState {
   announcements: Announcement[]
   cues: Cue[]
   reminders: Reminder[]
+  qaRelay: QaRelay | null
   activeCueId: string
   fontScale: number
   online: boolean
